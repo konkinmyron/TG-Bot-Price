@@ -1,0 +1,201 @@
+import logging
+import pandas as pd
+import io
+import re
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+
+# Состояния
+CHOOSING_MODE, REPRICE_DATA, PROMO_START, PROMO_END, PROMO_DATA = range(5)
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# --- КЛАВИАТУРЫ ---
+def get_main_menu_keyboard():
+    return ReplyKeyboardMarkup([['Переоценка', 'Промо']], resize_keyboard=True)
+
+def get_cancel_keyboard(with_today=False):
+    buttons = [['❌ В меню']]
+    if with_today:
+        buttons.insert(0, ['Сегодня'])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+def get_promo_end_keyboard():
+    return ReplyKeyboardMarkup([
+        ['До конца месяца', '1 месяц'],
+        ['3 месяца', 'До конца года'],
+        ['❌ В меню']
+    ], resize_keyboard=True)
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def clean_code(text):
+    clean = re.sub(r'(?i)код[:\s\.]*', '', text)
+    return re.sub(r'\D', '', clean)
+
+def calculate_end_date(text):
+    now = datetime.now()
+    if text == 'До конца месяца':
+        last_day = now + relativedelta(day=31)
+        return last_day.strftime("%d.%m.%Y")
+    elif text == '1 месяц':
+        return (now + relativedelta(months=1)).strftime("%d.%m.%Y")
+    elif text == '3 месяца':
+        return (now + relativedelta(months=3)).strftime("%d.%m.%Y")
+    elif text == 'До конца года':
+        return datetime(now.year, 12, 31).strftime("%d.%m.%Y")
+    return text
+
+# --- ОБЩИЕ КОМАНДЫ ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Выберите режим работы:", reply_markup=get_main_menu_keyboard())
+    return CHOOSING_MODE
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Возвращаюсь в главное меню.", reply_markup=get_main_menu_keyboard())
+    return CHOOSING_MODE
+
+# --- ПЕРЕОЦЕНКА (ОБНОВЛЕННАЯ КОЛОНКА) ---
+async def reprice_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Режим: Переоценка.\nПришлите товары (Пример: 3163714 289):", 
+        reply_markup=get_cancel_keyboard()
+    )
+    return REPRICE_DATA
+
+async def handle_reprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = [line.strip() for line in update.message.text.split('\n') if line.strip()]
+    all_rows = []
+    current_date = datetime.now().strftime("%d.%m.%Y")
+    
+    first_line_digits = clean_code(lines[0])
+    is_bulk = len(lines) > 1 and len(lines[0].split()) == 1 and first_line_digits
+    common_price = first_line_digits if is_bulk else None
+    items = lines[1:] if is_bulk else lines
+
+    for line in items:
+        if is_bulk:
+            item_code, item_price = clean_code(line), common_price
+        else:
+            parts = line.split()
+            if len(parts) < 2: continue
+            item_code, item_price = clean_code(parts[0]), parts[1].replace(',', '.')
+
+        if item_code and item_price:
+            for g in ["61", "15", "RIP"]:
+                all_rows.append({
+                    "Отношение": "Цена (продажи)", 
+                    "Код счета": "Группа", 
+                    "Выбор счета": g,
+                    "Код номенклатуры": "Таблица", 
+                    "Связь номенклатуры": item_code,
+                    "Начальная дата": current_date, 
+                    "Конечная дата": "", # Новая пустая колонка
+                    "Сумма в валюте": item_price, 
+                    "Валюта": "UAH"
+                })
+    return await send_excel(update, all_rows, f"Reprice_{current_date}.xlsx")
+
+# --- ПРОМО ---
+async def promo_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "💠 **Промо: Шаг 1**\nВведите дату НАЧАЛА (ДД.ММ.ГГГГ) или нажмите кнопку:",
+        reply_markup=get_cancel_keyboard(with_today=True),
+        parse_mode='Markdown'
+    )
+    return PROMO_START
+
+async def get_promo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    context.user_data['start_date'] = datetime.now().strftime("%d.%m.%Y") if text == "Сегодня" else text
+    await update.message.reply_text(
+        "💠 **Промо: Шаг 2**\nВведите дату ОКОНЧАНИЯ или выберите период:", 
+        reply_markup=get_promo_end_keyboard(),
+        parse_mode='Markdown'
+    )
+    return PROMO_END
+
+async def get_promo_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw_text = update.message.text.strip()
+    calculated_date = calculate_end_date(raw_text)
+    context.user_data['end_date'] = calculated_date
+    await update.message.reply_text(
+        f"✅ Конец: `{calculated_date}`\n\n💠 **Шаг 3**\nПришлите: `Код Верхняя Нижняя`",
+        reply_markup=get_cancel_keyboard(),
+        parse_mode='Markdown'
+    )
+    return PROMO_DATA
+
+async def handle_promo_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = [line.strip() for line in update.message.text.split('\n') if line.strip()]
+    data_list = []
+    s_date = context.user_data.get('start_date')
+    e_date = context.user_data.get('end_date')
+
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3: continue
+        item_code, v_price, n_price = clean_code(parts[0]), parts[1].replace(',', '.'), parts[2].replace(',', '.')
+
+        row = [""] * 40 
+        row[1] = item_code   # B
+        row[4] = s_date      # E
+        row[5] = e_date      # F
+        row[12] = "HL"       # M
+        row[15] = "3"        # P
+        row[16] = "20.00"    # Q
+        row[20] = "0000006"  # U
+        row[21] = v_price    # V
+        row[22] = n_price    # W
+        row[23] = ""         # X
+        row[24] = "100"      # Y
+        row[28] = "3"        # AC
+        row[32] = "Цена"     # AG
+        data_list.append(row)
+
+    columns = ["" for _ in range(40)]
+    columns[1], columns[4], columns[5], columns[12], columns[15], columns[16], columns[20], columns[21], columns[22], columns[23], columns[24], columns[28], columns[32] = \
+    "товар (код)", "Начальная дата", "Конечная дата", "Новый ти", "Кр.маячок", "Доля кредита", "Новый РМА", "Верхня ціна", "Нижня ціна", "X (Пусто)", "Плановое кол-во", "СН КМ для нижней цены", "Маркер"
+
+    df = pd.DataFrame(data_list, columns=columns)
+    return await send_excel(update, df, f"Promo_{s_date}.xlsx")
+
+# --- ОТПРАВКА ---
+async def send_excel(update: Update, data, filename):
+    if not isinstance(data, pd.DataFrame):
+        data = pd.DataFrame(data)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        data.to_excel(writer, index=False)
+    output.seek(0)
+    await update.message.reply_document(document=output, filename=filename, caption="✅ Готово!")
+    await update.message.reply_text("Выберите режим:", reply_markup=get_main_menu_keyboard())
+    return CHOOSING_MODE
+
+def main():
+    # ЗАМЕНИТЕ ТОКЕН ПЕРЕД ЗАПУСКОМ
+    TOKEN = "8577973762:AAEIFEtbIRrQt9CaOtosch8fbYi_GLe-jCA"
+    app = Application.builder().token(TOKEN).build()
+    
+    cancel_filter = filters.Regex('^❌ В меню$')
+    conv = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            CHOOSING_MODE: [
+                MessageHandler(filters.Regex('^Переоценка$'), reprice_mode), 
+                MessageHandler(filters.Regex('^Промо$'), promo_mode)
+            ],
+            REPRICE_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~cancel_filter, handle_reprice)],
+            PROMO_START: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~cancel_filter, get_promo_start)],
+            PROMO_END: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~cancel_filter, get_promo_end)],
+            PROMO_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~cancel_filter, handle_promo_data)],
+        },
+        fallbacks=[MessageHandler(cancel_filter, cancel), CommandHandler('start', start)],
+        allow_reentry=True
+    )
+    app.add_handler(conv)
+    app.run_polling()
+
+if __name__ == '__main__':
+    main()
